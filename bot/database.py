@@ -1,15 +1,16 @@
 from typing import Optional, Any
 
-import pymongo
-import uuid
 from datetime import datetime
+from uuid import uuid4
 
-import config
+from pymongo import MongoClient
+
+from config import MONGODB_URI, MODELS
 
 
 class Database:
     def __init__(self):
-        self.client = pymongo.MongoClient(config.mongodb_uri)
+        self.client = MongoClient(MONGODB_URI)
         self.db = self.client["chatgpt_telegram_bot"]
 
         self.user_collection = self.db["user"]
@@ -45,7 +46,7 @@ class Database:
 
             "current_dialog_id": None,
             "current_chat_mode": "assistant",
-            "current_model": config.models["available_text_models"][0],
+            "current_model": MODELS["available_text_models"][0],
 
             "n_used_tokens": {},
 
@@ -59,7 +60,7 @@ class Database:
     def start_new_dialog(self, user_id: int):
         self.check_if_user_exists(user_id, raise_exception=True)
 
-        dialog_id = str(uuid.uuid4())
+        dialog_id = str(uuid4())
         dialog_dict = {
             "_id": dialog_id,
             "user_id": user_id,

@@ -1,13 +1,14 @@
-import io
-import logging
-import asyncio
-import traceback
-import html
-import json
-from datetime import datetime
-import openai
+from asyncio import CancelledError, Semaphore, create_task, sleep
+from base64 import b64encode
+from html import escape
+from io import BytesIO
+from json import dumps
+from logging import getLogger
+from traceback import format_exception
 
-import telegram
+from datetime import datetime
+
+from openai import InvalidRequestError
 from telegram import (
     Update,
     User,
@@ -25,17 +26,17 @@ from telegram.ext import (
     AIORateLimiter,
     filters
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ParseMode
 
-import config
-import database
-import openai_utils
+from telegram.error import BadRequest
 
-import base64
+from database import Database
+from config import N_CHAT_MODES_PER_PAGE, MODELS, HELP_GROUP_CHAT_VIDEO_PATH, NEW_DIALOG_TIMEOUT, CHAT_MODES, ENABLE_MESSAGE_STREAMING, RETURN_N_GENERATED_IMAGES, IMAGE_SIZE, TELEGRAM_TOKEN, ALLOWED_TELEGRAM_USERNAMES
+from openai_utils import ChatGPT, generate_images, transcribe_audio
 
 # setup
-db = database.Database()
-logger = logging.getLogger(__name__)
+db = Database()
+logger = getLogger(__name__)
 
 user_semaphores = {}
 user_tasks = {}
@@ -85,16 +86,16 @@ async def register_user_if_not_exists(update: Update, context: CallbackContext, 
         db.start_new_dialog(user.id)
 
     if user.id not in user_semaphores:
-        user_semaphores[user.id] = asyncio.Semaphore(1)
+        user_semaphores[user.id] = Semaphore(1)
 
     if db.get_user_attribute(user.id, "current_model") is None:
-        db.set_user_attribute(user.id, "current_model", config.models["available_text_models"][0])
+        db.set_user_attribute(user.id, "current_model", MODELS["available_text_models"][0])
 
     # back compatibility for n_used_tokens field
     n_used_tokens = db.get_user_attribute(user.id, "n_used_tokens")
     if isinstance(n_used_tokens, int) or isinstance(n_used_tokens, float):  # old format
         new_n_used_tokens = {
-            "gpt-3.5-turbo": {
+            MODELS["default_model"]: {
                 "n_input_tokens": 0,
                 "n_output_tokens": n_used_tokens
             }
@@ -158,7 +159,7 @@ async def help_group_chat_handle(update: Update, context: CallbackContext):
      text = HELP_GROUP_CHAT_MESSAGE.format(bot_username="@" + context.bot.username)
 
      await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-     await update.message.reply_video(config.help_group_chat_video_path)
+     await update.message.reply_video(HELP_GROUP_CHAT_VIDEO_PATH)
 
 
 async def retry_handle(update: Update, context: CallbackContext):
@@ -185,9 +186,9 @@ async def _vision_message_handle_fn(
     user_id = update.message.from_user.id
     current_model = db.get_user_attribute(user_id, "current_model")
 
-    if current_model != "gpt-4-vision-preview" and current_model != "gpt-4o":
+    if current_model not in MODELS["available_image_reasoning_models"]:
         await update.message.reply_text(
-            "🥲 Images processing is only available for <b>gpt-4-vision-preview</b> and <b>gpt-4o</b> model. Please change your settings in /settings",
+            f"🥲 Images processing is only available for {MODELS['available_image_reasoning_models']} models. Please change your settings in /settings",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -196,9 +197,9 @@ async def _vision_message_handle_fn(
 
     # new dialog timeout
     if use_new_dialog_timeout:
-        if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
+        if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > NEW_DIALOG_TIMEOUT and len(db.get_dialog_messages(user_id)) > 0:
             db.start_new_dialog(user_id)
-            await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"Starting new dialog due to timeout (<b>{CHAT_MODES[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
 
     buf = None
@@ -207,7 +208,7 @@ async def _vision_message_handle_fn(
         photo_file = await context.bot.get_file(photo.file_id)
 
         # store file in memory, not on disk
-        buf = io.BytesIO()
+        buf = BytesIO()
         await photo_file.download_to_memory(buf)
         buf.name = "image.jpg"  # file extension is required
         buf.seek(0)  # move cursor to the beginning of the buffer
@@ -225,11 +226,11 @@ async def _vision_message_handle_fn(
 
         dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
         parse_mode = {"html": ParseMode.HTML, "markdown": ParseMode.MARKDOWN}[
-            config.chat_modes[chat_mode]["parse_mode"]
+            CHAT_MODES[chat_mode]["parse_mode"]
         ]
 
-        chatgpt_instance = openai_utils.ChatGPT(model=current_model)
-        if config.enable_message_streaming:
+        chatgpt_instance = ChatGPT(model=current_model)
+        if ENABLE_MESSAGE_STREAMING:
             gen = chatgpt_instance.send_vision_message_stream(
                 message,
                 dialog_messages=dialog_messages,
@@ -278,7 +279,7 @@ async def _vision_message_handle_fn(
                     message_id=placeholder_message.message_id,
                     parse_mode=parse_mode,
                 )
-            except telegram.error.BadRequest as e:
+            except BadRequest as e:
                 if str(e).startswith("Message is not modified"):
                     continue
                 else:
@@ -288,13 +289,13 @@ async def _vision_message_handle_fn(
                         message_id=placeholder_message.message_id,
                     )
 
-            await asyncio.sleep(0.01)  # wait a bit to avoid flooding
+            await sleep(0.01)  # wait a bit to avoid flooding
 
             prev_answer = answer
 
         # update user data
         if buf is not None:
-            base_image = base64.b64encode(buf.getvalue()).decode("utf-8")
+            base_image = b64encode(buf.getvalue()).decode("utf-8")
             new_dialog_message = {"user": [
                         {
                             "type": "text",
@@ -317,7 +318,7 @@ async def _vision_message_handle_fn(
 
         db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
 
-    except asyncio.CancelledError:
+    except CancelledError:
         # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
         db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
         raise
@@ -365,9 +366,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     async def message_handle_fn():
         # new dialog timeout
         if use_new_dialog_timeout:
-            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout and len(db.get_dialog_messages(user_id)) > 0:
+            if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > NEW_DIALOG_TIMEOUT and len(db.get_dialog_messages(user_id)) > 0:
                 db.start_new_dialog(user_id)
-                await update.message.reply_text(f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
+                await update.message.reply_text(f"Starting new dialog due to timeout (<b>{CHAT_MODES[chat_mode]['name']}</b> mode) ✅", parse_mode=ParseMode.HTML)
         db.set_user_attribute(user_id, "last_interaction", datetime.now())
 
         # in case of CancelledError
@@ -388,10 +389,10 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             parse_mode = {
                 "html": ParseMode.HTML,
                 "markdown": ParseMode.MARKDOWN
-            }[config.chat_modes[chat_mode]["parse_mode"]]
+            }[CHAT_MODES[chat_mode]["parse_mode"]]
 
-            chatgpt_instance = openai_utils.ChatGPT(model=current_model)
-            if config.enable_message_streaming:
+            chatgpt_instance = ChatGPT(model=current_model)
+            if ENABLE_MESSAGE_STREAMING:
                 gen = chatgpt_instance.send_message_stream(_message, dialog_messages=dialog_messages, chat_mode=chat_mode)
             else:
                 answer, (n_input_tokens, n_output_tokens), n_first_dialog_messages_removed = await chatgpt_instance.send_message(
@@ -418,13 +419,13 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
                 try:
                     await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id, parse_mode=parse_mode)
-                except telegram.error.BadRequest as e:
+                except BadRequest as e:
                     if str(e).startswith("Message is not modified"):
                         continue
                     else:
                         await context.bot.edit_message_text(answer, chat_id=placeholder_message.chat_id, message_id=placeholder_message.message_id)
 
-                await asyncio.sleep(0.01)  # wait a bit to avoid flooding
+                await sleep(0.01)  # wait a bit to avoid flooding
                 
                 prev_answer = answer
             
@@ -439,7 +440,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
             db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
 
-        except asyncio.CancelledError:
+        except CancelledError:
             # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
             db.update_n_used_tokens(user_id, current_model, n_input_tokens, n_output_tokens)
             raise
@@ -459,19 +460,19 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
-        if current_model == "gpt-4-vision-preview" or current_model == "gpt-4o" or update.message.photo is not None and len(update.message.photo) > 0:
+        if current_model in MODELS["available_image_reasoning_models"] or update.message.photo is not None and len(update.message.photo) > 0:
 
             logger.error(current_model)
             # What is this? ^^^
 
-            if current_model != "gpt-4o" and current_model != "gpt-4-vision-preview":
-                current_model = "gpt-4o"
-                db.set_user_attribute(user_id, "current_model", "gpt-4o")
-            task = asyncio.create_task(
+            if current_model not in MODELS["available_image_reasoning_models"]:
+                current_model = MODELS["available_image_reasoning_models"][0]
+                db.set_user_attribute(user_id, "current_model", MODELS["available_image_reasoning_models"][0])
+            task = create_task(
                 _vision_message_handle_fn(update, context, use_new_dialog_timeout=use_new_dialog_timeout)
             )
         else:
-            task = asyncio.create_task(
+            task = create_task(
                 message_handle_fn()
             )            
 
@@ -479,7 +480,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
         try:
             await task
-        except asyncio.CancelledError:
+        except CancelledError:
             await update.message.reply_text("✅ Canceled", parse_mode=ParseMode.HTML)
         else:
             pass
@@ -516,12 +517,12 @@ async def voice_message_handle(update: Update, context: CallbackContext):
     voice_file = await context.bot.get_file(voice.file_id)
     
     # store file in memory, not on disk
-    buf = io.BytesIO()
+    buf = BytesIO()
     await voice_file.download_to_memory(buf)
     buf.name = "voice.oga"  # file extension is required
     buf.seek(0)  # move cursor to the beginning of the buffer
 
-    transcribed_text = await openai_utils.transcribe_audio(buf)
+    transcribed_text = await transcribe_audio(buf)
     text = f"🎤: <i>{transcribed_text}</i>"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -543,8 +544,8 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
     message = message or update.message.text
 
     try:
-        image_urls = await openai_utils.generate_images(message, n_images=config.return_n_generated_images, size=config.image_size)
-    except openai.error.InvalidRequestError as e:
+        image_urls = await generate_images(message, n_images=RETURN_N_GENERATED_IMAGES, size=IMAGE_SIZE)
+    except InvalidRequestError as e:
         if str(e).startswith("Your request was rejected as a result of our safety system"):
             text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -553,7 +554,7 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
             raise
 
     # token usage
-    db.set_user_attribute(user_id, "n_generated_images", config.return_n_generated_images + db.get_user_attribute(user_id, "n_generated_images"))
+    db.set_user_attribute(user_id, "n_generated_images", RETURN_N_GENERATED_IMAGES + db.get_user_attribute(user_id, "n_generated_images"))
 
     for i, image_url in enumerate(image_urls):
         await update.message.chat.send_action(action="upload_photo")
@@ -566,13 +567,13 @@ async def new_dialog_handle(update: Update, context: CallbackContext):
 
     user_id = update.message.from_user.id
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
-    db.set_user_attribute(user_id, "current_model", "gpt-3.5-turbo")
+    db.set_user_attribute(user_id, "current_model", MODELS["default_model"])
 
     db.start_new_dialog(user_id)
     await update.message.reply_text("Starting new dialog ✅")
 
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
-    await update.message.reply_text(f"{config.chat_modes[chat_mode]['welcome_message']}", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"{CHAT_MODES[chat_mode]['welcome_message']}", parse_mode=ParseMode.HTML)
 
 
 async def cancel_handle(update: Update, context: CallbackContext):
@@ -589,22 +590,21 @@ async def cancel_handle(update: Update, context: CallbackContext):
 
 
 def get_chat_mode_menu(page_index: int):
-    n_chat_modes_per_page = config.n_chat_modes_per_page
-    text = f"Select <b>chat mode</b> ({len(config.chat_modes)} modes available):"
+    text = f"Select <b>chat mode</b> ({len(CHAT_MODES)} modes available):"
 
     # buttons
-    chat_mode_keys = list(config.chat_modes.keys())
-    page_chat_mode_keys = chat_mode_keys[page_index * n_chat_modes_per_page:(page_index + 1) * n_chat_modes_per_page]
+    chat_mode_keys = list(CHAT_MODES.keys())
+    page_chat_mode_keys = chat_mode_keys[page_index * N_CHAT_MODES_PER_PAGE:(page_index + 1) * N_CHAT_MODES_PER_PAGE]
 
     keyboard = []
     for chat_mode_key in page_chat_mode_keys:
-        name = config.chat_modes[chat_mode_key]["name"]
+        name = CHAT_MODES[chat_mode_key]["name"]
         keyboard.append([InlineKeyboardButton(name, callback_data=f"set_chat_mode|{chat_mode_key}")])
 
     # pagination
-    if len(chat_mode_keys) > n_chat_modes_per_page:
+    if len(chat_mode_keys) > N_CHAT_MODES_PER_PAGE:
         is_first_page = (page_index == 0)
-        is_last_page = ((page_index + 1) * n_chat_modes_per_page >= len(chat_mode_keys))
+        is_last_page = ((page_index + 1) * N_CHAT_MODES_PER_PAGE >= len(chat_mode_keys))
 
         if is_first_page:
             keyboard.append([
@@ -653,7 +653,7 @@ async def show_chat_modes_callback_handle(update: Update, context: CallbackConte
      text, reply_markup = get_chat_mode_menu(page_index)
      try:
          await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-     except telegram.error.BadRequest as e:
+     except BadRequest as e:
          if str(e).startswith("Message is not modified"):
              pass
 
@@ -672,17 +672,17 @@ async def set_chat_mode_handle(update: Update, context: CallbackContext):
 
     await context.bot.send_message(
         update.callback_query.message.chat.id,
-        f"{config.chat_modes[chat_mode]['welcome_message']}",
+        f"{CHAT_MODES[chat_mode]['welcome_message']}",
         parse_mode=ParseMode.HTML
     )
 
 
 def get_settings_menu(user_id: int):
     current_model = db.get_user_attribute(user_id, "current_model")
-    text = config.models["info"][current_model]["description"]
+    text = MODELS["info"][current_model]["description"]
 
     text += "\n\n"
-    score_dict = config.models["info"][current_model]["scores"]
+    score_dict = MODELS["info"][current_model]["scores"]
     for score_key, score_value in score_dict.items():
         text += "🟢" * score_value + "⚪️" * (5 - score_value) + f" – {score_key}\n\n"
 
@@ -690,8 +690,8 @@ def get_settings_menu(user_id: int):
 
     # buttons to choose models
     buttons = []
-    for model_key in config.models["available_text_models"]:
-        title = config.models["info"][model_key]["name"]
+    for model_key in MODELS["available_text_models"]:
+        title = MODELS["info"][model_key]["name"]
         if model_key == current_model:
             title = "✅ " + title
 
@@ -728,7 +728,7 @@ async def set_settings_handle(update: Update, context: CallbackContext):
     text, reply_markup = get_settings_menu(user_id)
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    except telegram.error.BadRequest as e:
+    except BadRequest as e:
         if str(e).startswith("Message is not modified"):
             pass
 
@@ -752,21 +752,21 @@ async def show_balance_handle(update: Update, context: CallbackContext):
         n_input_tokens, n_output_tokens = n_used_tokens_dict[model_key]["n_input_tokens"], n_used_tokens_dict[model_key]["n_output_tokens"]
         total_n_used_tokens += n_input_tokens + n_output_tokens
 
-        n_input_spent_dollars = config.models["info"][model_key]["price_per_1000_input_tokens"] * (n_input_tokens / 1000)
-        n_output_spent_dollars = config.models["info"][model_key]["price_per_1000_output_tokens"] * (n_output_tokens / 1000)
+        n_input_spent_dollars = MODELS["info"][model_key]["price_per_1M_input_tokens"] * (n_input_tokens / 10^6)
+        n_output_spent_dollars = MODELS["info"][model_key]["price_per_1M_output_tokens"] * (n_output_tokens / 10^6)
         total_n_spent_dollars += n_input_spent_dollars + n_output_spent_dollars
 
         details_text += f"- {model_key}: <b>{n_input_spent_dollars + n_output_spent_dollars:.03f}$</b> / <b>{n_input_tokens + n_output_tokens} tokens</b>\n"
 
     # image generation
-    image_generation_n_spent_dollars = config.models["info"]["dalle-2"]["price_per_1_image"] * n_generated_images
+    image_generation_n_spent_dollars = MODELS["info"]["dalle-2"]["price_per_1_image"] * n_generated_images
     if n_generated_images != 0:
         details_text += f"- DALL·E 2 (image generation): <b>{image_generation_n_spent_dollars:.03f}$</b> / <b>{n_generated_images} generated images</b>\n"
 
     total_n_spent_dollars += image_generation_n_spent_dollars
 
     # voice recognition
-    voice_recognition_n_spent_dollars = config.models["info"]["whisper"]["price_per_1_min"] * (n_transcribed_seconds / 60)
+    voice_recognition_n_spent_dollars = MODELS["info"]["whisper"]["price_per_1_min"] * (n_transcribed_seconds / 60)
     if n_transcribed_seconds != 0:
         details_text += f"- Whisper (voice recognition): <b>{voice_recognition_n_spent_dollars:.03f}$</b> / <b>{n_transcribed_seconds:.01f} seconds</b>\n"
 
@@ -789,27 +789,28 @@ async def edited_message_handle(update: Update, context: CallbackContext):
 async def error_handle(update: Update, context: CallbackContext) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
 
-    try:
-        # collect error message
-        tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
-        tb_string = "".join(tb_list)
-        update_str = update.to_dict() if isinstance(update, Update) else str(update)
-        message = (
-            f"An exception was raised while handling an update\n"
-            f"<pre>update = {html.escape(json.dumps(update_str, indent=2, ensure_ascii=False))}"
-            "</pre>\n\n"
-            f"<pre>{html.escape(tb_string)}</pre>"
-        )
+    # try:
+    #     # collect error message
+    #     tb_list = format_exception(None, context.error, context.error.__traceback__)
+    #     tb_string = "".join(tb_list)
+    #     update_str = update.to_dict() if isinstance(update, Update) else str(update)
+    #     message = (
+    #         f"An exception was raised while handling an update\n"
+    #         f"<pre>update = {escape(dumps(update_str, indent=2, ensure_ascii=False))}"
+    #         "</pre>\n\n"
+    #         f"<pre>{escape(tb_string)}</pre>"
+    #     )
 
-        # split text into multiple messages due to 4096 character limit
-        for message_chunk in split_text_into_chunks(message, 4096):
-            try:
-                await context.bot.send_message(update.effective_chat.id, message_chunk, parse_mode=ParseMode.HTML)
-            except telegram.error.BadRequest:
-                # answer has invalid characters, so we send it without parse_mode
-                await context.bot.send_message(update.effective_chat.id, message_chunk)
-    except:
-        await context.bot.send_message(update.effective_chat.id, "Some error in error handler")
+    #     # split text into multiple messages due to 4096 character limit
+    #     for message_chunk in split_text_into_chunks(message, 4096):
+    #         try:
+    #             await context.bot.send_message(update.effective_chat.id, message_chunk, parse_mode=ParseMode.HTML)
+    #         except BadRequest:
+    #             # answer has invalid characters, so we send it without parse_mode
+    #             await context.bot.send_message(update.effective_chat.id if update else None, message_chunk)
+    # except:
+    #     pass
+    #     # await context.bot.send_message(update.effective_chat.id if update else None, "Some error in error handler")
 
 async def post_init(application: Application):
     await application.bot.set_my_commands([
@@ -824,7 +825,7 @@ async def post_init(application: Application):
 def run_bot() -> None:
     application = (
         ApplicationBuilder()
-        .token(config.telegram_token)
+        .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
         .rate_limiter(AIORateLimiter(max_retries=5))
         .http_version("1.1")
@@ -835,9 +836,9 @@ def run_bot() -> None:
 
     # add handlers
     user_filter = filters.ALL
-    if len(config.allowed_telegram_usernames) > 0:
-        usernames = [x for x in config.allowed_telegram_usernames if isinstance(x, str)]
-        any_ids = [x for x in config.allowed_telegram_usernames if isinstance(x, int)]
+    if len(ALLOWED_TELEGRAM_USERNAMES) > 0:
+        usernames = [x for x in ALLOWED_TELEGRAM_USERNAMES if isinstance(x, str)]
+        any_ids = [x for x in ALLOWED_TELEGRAM_USERNAMES if isinstance(x, int)]
         user_ids = [x for x in any_ids if x > 0]
         group_ids = [x for x in any_ids if x < 0]
         user_filter = filters.User(username=usernames) | filters.User(user_id=user_ids) | filters.Chat(chat_id=group_ids)
